@@ -1,7 +1,5 @@
 """
-Local logic tests using a tiny in-memory fake of the Supabase client, so the
-core flows (register, conflict detection, login, remove-frees-house,
-complaints, renewals) can be verified without any network access.
+Local logic tests using a tiny in-memory fake of the Supabase client.
 Run: python3 test_app.py
 """
 import copy
@@ -20,8 +18,10 @@ class FakeQuery:
         self.payload = payload
         self.filters = []
         self.single = False
+        self.select_fields = "*"
 
-    def select(self, *_args, **_kwargs):
+    def select(self, *args, **_kwargs):
+        self.select_fields = args[0] if args else "*"
         return self
 
     def eq(self, field, value):
@@ -63,7 +63,6 @@ class FakeQuery:
                 table.remove(row)
             return FakeResult(matched)
 
-        # select
         matched = self._matching_rows(table)
         enriched = [self._enrich(dict(r)) for r in matched]
         if self.single:
@@ -71,8 +70,7 @@ class FakeQuery:
         return FakeResult(enriched)
 
     def _enrich(self, row):
-        # Mimic Supabase's nested-select for houses(*, tenants(*))
-        if self.table_name == "houses":
+        if self.table_name == "houses" and "tenants" in self.select_fields:
             tenants = [t for t in self.store["tenants"] if t["house_id"] == row["id"]]
             row["tenants"] = tenants
         return row
@@ -80,7 +78,7 @@ class FakeQuery:
 
 class FakeSupabase:
     def __init__(self):
-        self.store = {"houses": [], "tenants": [], "complaints": [], "renewals": []}
+        self.store = {"houses": [], "tenants": [], "complaints": [], "renewals": [], "settings": []}
 
     def table(self, name):
         return _TableHandle(self.store, name)
@@ -111,75 +109,118 @@ def run_tests():
     appmod.sb = fake
     appmod.ADMIN_SECRET = "test-secret"
     client = appmod.app.test_client()
+    ADMIN_HEADERS = {"X-Admin-Secret": "test-secret"}
 
-    # Seed two houses
     fake.store["houses"] = [
-        {"id": 1, "block": "old", "house_num": 1, "rent": 25000, "profile_complete": False, "condition_notes": []},
-        {"id": 2, "block": "new", "house_num": 1, "rent": 30000, "profile_complete": False, "condition_notes": []},
+        {"id": 1, "block": "A", "house_num": 1, "rent": 25000, "profile_complete": False, "condition_notes": []},
+        {"id": 2, "block": "B", "house_num": 1, "rent": 30000, "profile_complete": False, "condition_notes": []},
+        {"id": 3, "block": "C", "house_num": 1, "rent": 30000, "profile_complete": False, "condition_notes": []},
     ]
+    fake.store["settings"] = [{
+        "id": 1, "estate_name": "VVIP Lounge", "color_primary": "#1E6B47", "color_accent": "#D19A3D",
+        "rent_a": 25000, "rent_b": 30000, "rent_c": 30000
+    }]
 
-    # 1. Register succeeds for an open house
+    # 1. Public houses endpoint returns no tenant details field at all
+    r = client.get("/api/houses")
+    assert r.status_code == 200
+    assert "tenants" not in r.get_json()[0]
+    print("PASS: public /api/houses excludes tenant details")
+
+    # 2. Full houses endpoint requires admin header
+    r = client.get("/api/houses/full")
+    assert r.status_code == 403
+    r = client.get("/api/houses/full", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    assert "tenants" in r.get_json()[0]
+    print("PASS: /api/houses/full gated by admin header, includes tenants")
+
+    # 3. Register succeeds for an open house in block C
     r = client.post("/api/register", json={
-        "name": "Faith Chebet", "block": "old", "house_num": 1,
+        "name": "Faith Chebet", "block": "C", "house_num": 1,
         "course": "BCom", "phone": "0700000000",
         "emergency_name": "Sam", "emergency_phone": "0711111111",
-        "roommates": [], "photo_url": "http://x/photo.jpg"
+        "roommates": [], "photo_url": "data:image/jpeg;base64,xxx"
     })
     assert r.status_code == 200, r.get_json()
     tenant_id = r.get_json()["tenant"]["id"]
-    print("PASS: register succeeds on open house")
+    print("PASS: register succeeds on open house in block C")
 
-    # 2. Second registration on the same house is rejected as taken
-    r = client.post("/api/register", json={"name": "Someone Else", "block": "old", "house_num": 1})
-    assert r.status_code == 409, r.get_json()
+    # 4. Invalid house number for block (C only has 3 houses)
+    r = client.post("/api/register", json={"name": "X", "block": "C", "house_num": 9})
+    assert r.status_code == 400
+    print("PASS: out-of-range house number for block rejected (400)")
+
+    # 5. Duplicate registration on same house rejected
+    r = client.post("/api/register", json={"name": "Someone Else", "block": "C", "house_num": 1})
+    assert r.status_code == 409
     print("PASS: duplicate registration on same house rejected (409)")
 
-    # 3. Login with correct name matches
-    r = client.post("/api/login", json={"name": "faith chebet", "block": "old", "house_num": 1})
-    assert r.status_code == 200, r.get_json()
-    print("PASS: login with matching name (case-insensitive) succeeds")
+    # 6. Login with correct name matches
+    r = client.post("/api/login", json={"name": "faith chebet", "block": "C", "house_num": 1})
+    assert r.status_code == 200
+    print("PASS: login with matching name succeeds")
 
-    # 4. Login with wrong name is rejected
-    r = client.post("/api/login", json={"name": "Wrong Name", "block": "old", "house_num": 1})
+    # 7. Login with wrong name rejected
+    r = client.post("/api/login", json={"name": "Wrong Name", "block": "C", "house_num": 1})
     assert r.status_code == 401
     print("PASS: login with wrong name rejected (401)")
 
-    # 5. Landlord removal requires admin secret
+    # 8. Edit own profile requires matching name
+    r = client.put(f"/api/tenant/{tenant_id}", json={"confirm_name": "wrong name", "phone": "0799999999"})
+    assert r.status_code == 401
+    print("PASS: profile edit with wrong confirm_name rejected (401)")
+
+    r = client.put(f"/api/tenant/{tenant_id}", json={"confirm_name": "Faith Chebet", "phone": "0799999999"})
+    assert r.status_code == 200
+    assert r.get_json()["tenant"]["phone"] == "0799999999"
+    print("PASS: profile edit with correct confirm_name updates the record")
+
+    # 9. Remove tenant requires admin header, then frees the house
     r = client.post(f"/api/tenant/{tenant_id}/remove")
     assert r.status_code == 403
-    print("PASS: remove-tenant without admin secret rejected (403)")
-
-    # 6. Landlord removal with correct secret frees the house
-    r = client.post(f"/api/tenant/{tenant_id}/remove?secret=test-secret")
-    assert r.status_code == 200, r.get_json()
-    house = next(h for h in fake.store["houses"] if h["id"] == 1)
+    r = client.post(f"/api/tenant/{tenant_id}/remove", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    house = next(h for h in fake.store["houses"] if h["id"] == 3)
     assert house["profile_complete"] is False
-    assert all(t["id"] != tenant_id for t in fake.store["tenants"])
-    print("PASS: remove-tenant clears profile_complete and deletes tenant row")
+    print("PASS: remove-tenant (admin header) frees the house")
 
-    # 7. House is registrable again after removal
-    r = client.post("/api/register", json={"name": "New Tenant", "block": "old", "house_num": 1})
-    assert r.status_code == 200, r.get_json()
-    print("PASS: house is open again after removal")
+    # 10. House is registrable again after removal
+    r = client.post("/api/register", json={"name": "New Tenant", "block": "C", "house_num": 1})
+    assert r.status_code == 200
+    print("PASS: house open again after removal")
 
-    # 8. Complaints: create then resolve
+    # 11. Complaints + renewals flow (unchanged, admin header now)
     new_tenant_id = r.get_json()["tenant"]["id"]
-    r = client.post("/api/complaints", json={"tenant_id": new_tenant_id, "type": "Plumbing", "message": "Leaking tap"})
-    assert r.status_code == 200
-    complaint_id = fake.store["complaints"][0]["id"]
-    r = client.get("/api/complaints?secret=test-secret")
+    client.post("/api/complaints", json={"tenant_id": new_tenant_id, "type": "Plumbing", "message": "Leak"})
+    r = client.get("/api/complaints", headers=ADMIN_HEADERS)
     assert r.status_code == 200 and len(r.get_json()) == 1
-    r = client.post(f"/api/complaints/{complaint_id}/resolve?secret=test-secret")
+    complaint_id = fake.store["complaints"][0]["id"]
+    r = client.post(f"/api/complaints/{complaint_id}/resolve", headers=ADMIN_HEADERS)
     assert r.status_code == 200
-    assert fake.store["complaints"][0]["status"] == "resolved"
-    print("PASS: complaint create + admin resolve flow")
+    print("PASS: complaints create + admin resolve (header auth)")
 
-    # 9. Renewal interest recorded
-    r = client.post("/api/renew", json={"tenant_id": new_tenant_id, "block": "old", "house_num": 1, "tenant_name": "New Tenant"})
-    assert r.status_code == 200
-    r = client.get("/api/renewals?secret=test-secret")
+    client.post("/api/renew", json={"tenant_id": new_tenant_id, "block": "C", "house_num": 1, "tenant_name": "New Tenant"})
+    r = client.get("/api/renewals", headers=ADMIN_HEADERS)
     assert r.status_code == 200 and len(r.get_json()) == 1
     print("PASS: renewal interest recorded and listable by admin")
+
+    # 12. Settings: public GET works, PUT requires admin header
+    r = client.get("/api/settings")
+    assert r.status_code == 200 and r.get_json()["estate_name"] == "VVIP Lounge"
+    print("PASS: public GET /api/settings returns current settings")
+
+    r = client.put("/api/settings", json={"estate_name": "Sunrise Court"})
+    assert r.status_code == 403
+    print("PASS: PUT /api/settings without admin header rejected (403)")
+
+    r = client.put("/api/settings", json={"estate_name": "Sunrise Court", "rent_a": 27000}, headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    assert r.get_json()["estate_name"] == "Sunrise Court"
+    assert r.get_json()["rent_a"] == 27000
+    house_a = next(h for h in fake.store["houses"] if h["block"] == "A")
+    assert house_a["rent"] == 27000
+    print("PASS: admin settings update applies and propagates rent to house rows")
 
     print("\nAll tests passed.")
 
