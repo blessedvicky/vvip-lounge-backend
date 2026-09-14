@@ -2,6 +2,7 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
+from postgrest.exceptions import APIError
 
 app = Flask(__name__)
 CORS(app)
@@ -13,6 +14,23 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 VALID_BLOCKS = {"A": 6, "B": 6, "C": 3}
 
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+
+
+def execute_write(query):
+    """
+    Run an insert/update/delete query, tolerating a known supabase-py bug
+    where a successful write with an empty response body gets mis-raised
+    as APIError({'message': 'Missing response', 'code': '204', ...}).
+    That specific case means the write actually succeeded — Postgres just
+    didn't send a row back. Any other APIError is a real failure and is
+    re-raised as-is.
+    """
+    try:
+        return query.execute()
+    except APIError as e:
+        if isinstance(e.args[0], dict) and e.args[0].get("code") == "204":
+            return None
+        raise
 
 
 def require_admin(req):
@@ -89,8 +107,9 @@ def register():
         "roommates": data.get("roommates", []),
         "photo_url": data.get("photo_url", ""),
     }
-    inserted = sb.table("tenants").insert(tenant).execute().data[0]
-    sb.table("houses").update({"profile_complete": True}).eq("id", house["id"]).execute()
+    execute_write(sb.table("tenants").insert(tenant))
+    execute_write(sb.table("houses").update({"profile_complete": True}).eq("id", house["id"]))
+    inserted = sb.table("tenants").select("*").eq("house_id", house["id"]).maybe_single().execute().data
     return jsonify({"tenant": inserted, "house": house})
 
 
@@ -132,7 +151,7 @@ def update_tenant(tenant_id):
         if field in data:
             updatable[field] = data[field]
     if updatable:
-        sb.table("tenants").update(updatable).eq("id", tenant_id).execute()
+        execute_write(sb.table("tenants").update(updatable).eq("id", tenant_id))
 
     refreshed = sb.table("tenants").select("*").eq("id", tenant_id).maybe_single().execute().data
     return jsonify({"tenant": refreshed})
@@ -148,8 +167,8 @@ def remove_tenant(tenant_id):
     if not tenant:
         return jsonify({"error": "not_found"}), 404
 
-    sb.table("tenants").delete().eq("id", tenant_id).execute()
-    sb.table("houses").update({"profile_complete": False}).eq("id", tenant["house_id"]).execute()
+    execute_write(sb.table("tenants").delete().eq("id", tenant_id))
+    execute_write(sb.table("houses").update({"profile_complete": False}).eq("id", tenant["house_id"]))
     return jsonify({"status": "removed"})
 
 
@@ -158,12 +177,12 @@ def remove_tenant(tenant_id):
 def complaints():
     if request.method == "POST":
         data = request.get_json(force=True)
-        sb.table("complaints").insert({
+        execute_write(sb.table("complaints").insert({
             "tenant_id": data.get("tenant_id"),
             "type": data.get("type"),
             "message": data.get("message"),
             "status": "open",
-        }).execute()
+        }))
         return jsonify({"status": "ok"})
 
     if not require_admin(request):
@@ -181,7 +200,7 @@ def complaints():
 def resolve_complaint(complaint_id):
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
-    sb.table("complaints").update({"status": "resolved"}).eq("id", complaint_id).execute()
+    execute_write(sb.table("complaints").update({"status": "resolved"}).eq("id", complaint_id))
     return jsonify({"status": "ok"})
 
 
@@ -202,12 +221,12 @@ def tenant_complaints(tenant_id):
 @app.route("/api/renew", methods=["POST"])
 def renew():
     data = request.get_json(force=True)
-    sb.table("renewals").insert({
+    execute_write(sb.table("renewals").insert({
         "tenant_id": data.get("tenant_id"),
         "block": data.get("block"),
         "house_num": data.get("house_num"),
         "tenant_name": data.get("tenant_name"),
-    }).execute()
+    }))
     return jsonify({"status": "ok"})
 
 
@@ -242,14 +261,14 @@ def update_settings():
         if field in data:
             updatable[field] = data[field]
     if updatable:
-        sb.table("settings").update(updatable).eq("id", 1).execute()
+        execute_write(sb.table("settings").update(updatable).eq("id", 1))
 
     # Keep each block's house rows in sync with the new rent so the public
     # /api/houses (and registration) reflect it immediately.
     rent_map = {"A": data.get("rent_a"), "B": data.get("rent_b"), "C": data.get("rent_c")}
     for block, rent in rent_map.items():
         if rent is not None:
-            sb.table("houses").update({"rent": rent}).eq("block", block).execute()
+            execute_write(sb.table("houses").update({"rent": rent}).eq("block", block))
 
     refreshed = sb.table("settings").select("*").eq("id", 1).maybe_single().execute()
     return jsonify(refreshed.data)

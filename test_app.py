@@ -222,6 +222,25 @@ def run_tests():
     assert house_a["rent"] == 27000
     print("PASS: admin settings update applies and propagates rent to house rows")
 
+    # 13. execute_write tolerates the exact "Missing response" bug seen on Render
+    class FakeQueryThatRaises:
+        def execute(self):
+            raise appmod.APIError({"message": "Missing response", "code": "204", "hint": "x", "details": "y"})
+    result = appmod.execute_write(FakeQueryThatRaises())
+    assert result is None
+    print("PASS: execute_write absorbs the known postgrest 'Missing response' bug")
+
+    class FakeQueryThatRaisesRealError:
+        def execute(self):
+            raise appmod.APIError({"message": "permission denied", "code": "42501"})
+    try:
+        appmod.execute_write(FakeQueryThatRaisesRealError())
+        raised = False
+    except appmod.APIError:
+        raised = True
+    assert raised
+    print("PASS: execute_write still raises genuine errors")
+
     print("\nAll tests passed.")
 
 
