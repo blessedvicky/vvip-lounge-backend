@@ -1,11 +1,17 @@
 import os
+import requests
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-from supabase import create_client
-from postgrest.exceptions import APIError
 
 app = Flask(__name__)
-CORS(app)
+
+# ---------- CORS (kept dependency-free, no flask_cors needed) ----------
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Secret"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return resp
+
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -13,69 +19,76 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 
 VALID_BLOCKS = {"A": 6, "B": 6, "C": 3}
 
-sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else None
+REST_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY or "",
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}" if SUPABASE_SERVICE_KEY else "",
+    "Content-Type": "application/json",
+}
 
 
-def execute_write(query):
-    """
-    Run an insert/update/delete query, tolerating a known supabase-py bug
-    where a successful write with an empty response body gets mis-raised
-    as APIError({'message': 'Missing response', 'code': '204', ...}).
-    That specific case means the write actually succeeded — Postgres just
-    didn't send a row back. Any other APIError is a real failure and is
-    re-raised as-is.
-    """
-    try:
-        return query.execute()
-    except APIError as e:
-        if isinstance(e.args[0], dict) and e.args[0].get("code") == "204":
-            return None
-        raise
+# ---------- Thin direct-REST helpers (talk to PostgREST ourselves — no
+# supabase-py in the middle, which is what was mis-parsing valid empty
+# responses as errors). Every filter value must already be PostgREST-style,
+# e.g. {"id": "eq.5"}. ----------
+def pg_select(table, params=None):
+    r = requests.get(f"{REST_URL}/{table}", headers=REST_HEADERS, params=params or {}, timeout=15)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+
+def pg_insert(table, payload):
+    headers = {**REST_HEADERS, "Prefer": "return=representation"}
+    r = requests.post(f"{REST_URL}/{table}", headers=headers, json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+
+def pg_update(table, payload, params):
+    headers = {**REST_HEADERS, "Prefer": "return=representation"}
+    r = requests.patch(f"{REST_URL}/{table}", headers=headers, params=params, json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+
+def pg_delete(table, params):
+    headers = {**REST_HEADERS, "Prefer": "return=representation"}
+    r = requests.delete(f"{REST_URL}/{table}", headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json() if r.text else []
 
 
 def require_admin(req):
-    # Admin passcode travels as a request header only (never in the URL),
-    # so it doesn't end up in browser history or server access logs.
     secret = req.headers.get("X-Admin-Secret")
     return ADMIN_SECRET is not None and secret == ADMIN_SECRET
 
 
 def house_full(block, house_num):
-    return (
-        sb.table("houses")
-        .select("*, tenants(*)")
-        .eq("block", block)
-        .eq("house_num", house_num)
-        .maybe_single()
-        .execute()
-        .data
-    )
+    rows = pg_select("houses", {
+        "select": "*,tenants(*)",
+        "block": f"eq.{block}",
+        "house_num": f"eq.{house_num}",
+    })
+    return rows[0] if rows else None
 
 
 # ---------- PUBLIC: occupancy only, no tenant details ----------
-# Used by the tenant portal's house picker so anyone loading the page
-# can see which houses are open, without exposing any tenant's name,
-# phone, emergency contact, or photo.
 @app.route("/api/houses", methods=["GET"])
 def list_houses_public():
-    res = (
-        sb.table("houses")
-        .select("id, block, house_num, rent, condition_notes, profile_complete")
-        .order("block")
-        .order("house_num")
-        .execute()
-    )
-    return jsonify(res.data)
+    rows = pg_select("houses", {
+        "select": "id,block,house_num,rent,condition_notes,profile_complete",
+        "order": "block.asc,house_num.asc",
+    })
+    return jsonify(rows)
 
 
 # ---------- ADMIN ONLY: full tenant details ----------
-# Used by the landlord dashboard once the admin passcode has been entered.
 @app.route("/api/houses/full", methods=["GET"])
 def list_houses_full():
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
-    res = sb.table("houses").select("*, tenants(*)").order("block").order("house_num").execute()
-    return jsonify(res.data)
+    rows = pg_select("houses", {"select": "*,tenants(*)", "order": "block.asc,house_num.asc"})
+    return jsonify(rows)
 
 
 # ---------- TENANT REGISTRATION (first-time sign-in) ----------
@@ -107,9 +120,9 @@ def register():
         "roommates": data.get("roommates", []),
         "photo_url": data.get("photo_url", ""),
     }
-    execute_write(sb.table("tenants").insert(tenant))
-    execute_write(sb.table("houses").update({"profile_complete": True}).eq("id", house["id"]))
-    inserted = sb.table("tenants").select("*").eq("house_id", house["id"]).maybe_single().execute().data
+    inserted_rows = pg_insert("tenants", tenant)
+    pg_update("houses", {"profile_complete": True}, {"id": f"eq.{house['id']}"})
+    inserted = inserted_rows[0] if inserted_rows else None
     return jsonify({"tenant": inserted, "house": house})
 
 
@@ -133,14 +146,13 @@ def login():
 
 
 # ---------- TENANT: EDIT OWN PROFILE ----------
-# Lightweight auth to match this app's simple model: the caller must supply
-# the tenant's own name (same as their login), not just the id.
 @app.route("/api/tenant/<int:tenant_id>", methods=["PUT"])
 def update_tenant(tenant_id):
     data = request.get_json(force=True)
     confirm_name = (data.get("confirm_name") or "").strip().lower()
 
-    existing = sb.table("tenants").select("*").eq("id", tenant_id).maybe_single().execute().data
+    existing_rows = pg_select("tenants", {"id": f"eq.{tenant_id}"})
+    existing = existing_rows[0] if existing_rows else None
     if not existing:
         return jsonify({"error": "not_found"}), 404
     if existing["name"].strip().lower() != confirm_name:
@@ -150,10 +162,13 @@ def update_tenant(tenant_id):
     for field in ("course", "phone", "emergency_name", "emergency_phone", "roommates", "photo_url"):
         if field in data:
             updatable[field] = data[field]
-    if updatable:
-        execute_write(sb.table("tenants").update(updatable).eq("id", tenant_id))
 
-    refreshed = sb.table("tenants").select("*").eq("id", tenant_id).maybe_single().execute().data
+    if updatable:
+        updated_rows = pg_update("tenants", updatable, {"id": f"eq.{tenant_id}"})
+        refreshed = updated_rows[0] if updated_rows else existing
+    else:
+        refreshed = existing
+
     return jsonify({"tenant": refreshed})
 
 
@@ -163,12 +178,13 @@ def remove_tenant(tenant_id):
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
-    tenant = sb.table("tenants").select("house_id").eq("id", tenant_id).maybe_single().execute().data
+    rows = pg_select("tenants", {"id": f"eq.{tenant_id}", "select": "house_id"})
+    tenant = rows[0] if rows else None
     if not tenant:
         return jsonify({"error": "not_found"}), 404
 
-    execute_write(sb.table("tenants").delete().eq("id", tenant_id))
-    execute_write(sb.table("houses").update({"profile_complete": False}).eq("id", tenant["house_id"]))
+    pg_delete("tenants", {"id": f"eq.{tenant_id}"})
+    pg_update("houses", {"profile_complete": False}, {"id": f"eq.{tenant['house_id']}"})
     return jsonify({"status": "removed"})
 
 
@@ -177,56 +193,48 @@ def remove_tenant(tenant_id):
 def complaints():
     if request.method == "POST":
         data = request.get_json(force=True)
-        execute_write(sb.table("complaints").insert({
+        pg_insert("complaints", {
             "tenant_id": data.get("tenant_id"),
             "type": data.get("type"),
             "message": data.get("message"),
             "status": "open",
-        }))
+        })
         return jsonify({"status": "ok"})
 
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
-    res = (
-        sb.table("complaints")
-        .select("*, tenants(name, houses(block, house_num))")
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return jsonify(res.data)
+    rows = pg_select("complaints", {
+        "select": "*,tenants(name,houses(block,house_num))",
+        "order": "created_at.desc",
+    })
+    return jsonify(rows)
 
 
 @app.route("/api/complaints/<int:complaint_id>/resolve", methods=["POST"])
 def resolve_complaint(complaint_id):
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
-    execute_write(sb.table("complaints").update({"status": "resolved"}).eq("id", complaint_id))
+    pg_update("complaints", {"status": "resolved"}, {"id": f"eq.{complaint_id}"})
     return jsonify({"status": "ok"})
 
 
 # ---------- TENANT-BY-TENANT: OWN COMPLAINTS ----------
 @app.route("/api/tenant/<int:tenant_id>/complaints", methods=["GET"])
 def tenant_complaints(tenant_id):
-    res = (
-        sb.table("complaints")
-        .select("*")
-        .eq("tenant_id", tenant_id)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return jsonify(res.data)
+    rows = pg_select("complaints", {"tenant_id": f"eq.{tenant_id}", "order": "created_at.desc"})
+    return jsonify(rows)
 
 
 # ---------- SEMESTER RENEWAL INTEREST ----------
 @app.route("/api/renew", methods=["POST"])
 def renew():
     data = request.get_json(force=True)
-    execute_write(sb.table("renewals").insert({
+    pg_insert("renewals", {
         "tenant_id": data.get("tenant_id"),
         "block": data.get("block"),
         "house_num": data.get("house_num"),
         "tenant_name": data.get("tenant_name"),
-    }))
+    })
     return jsonify({"status": "ok"})
 
 
@@ -234,20 +242,15 @@ def renew():
 def list_renewals():
     if not require_admin(request):
         return jsonify({"error": "unauthorized"}), 403
-    res = sb.table("renewals").select("*").order("created_at", desc=True).execute()
-    return jsonify(res.data)
-
-
-@app.route("/")
-def health():
-    return jsonify({"status": "VVIP Lounge backend running"})
+    rows = pg_select("renewals", {"order": "created_at.desc"})
+    return jsonify(rows)
 
 
 # ---------- SETTINGS (estate name, theme colors, rent per block) ----------
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
-    res = sb.table("settings").select("*").eq("id", 1).maybe_single().execute()
-    return jsonify(res.data)
+    rows = pg_select("settings", {"id": "eq.1"})
+    return jsonify(rows[0] if rows else None)
 
 
 @app.route("/api/settings", methods=["PUT"])
@@ -261,17 +264,25 @@ def update_settings():
         if field in data:
             updatable[field] = data[field]
     if updatable:
-        execute_write(sb.table("settings").update(updatable).eq("id", 1))
+        pg_update("settings", updatable, {"id": "eq.1"})
 
-    # Keep each block's house rows in sync with the new rent so the public
-    # /api/houses (and registration) reflect it immediately.
     rent_map = {"A": data.get("rent_a"), "B": data.get("rent_b"), "C": data.get("rent_c")}
     for block, rent in rent_map.items():
         if rent is not None:
-            execute_write(sb.table("houses").update({"rent": rent}).eq("block", block))
+            pg_update("houses", {"rent": rent}, {"block": f"eq.{block}"})
 
-    refreshed = sb.table("settings").select("*").eq("id", 1).maybe_single().execute()
-    return jsonify(refreshed.data)
+    refreshed = pg_select("settings", {"id": "eq.1"})
+    return jsonify(refreshed[0] if refreshed else None)
+
+
+@app.route("/")
+def health():
+    return jsonify({"status": "VVIP Lounge backend running"})
+
+
+@app.errorhandler(requests.exceptions.RequestException)
+def handle_upstream_error(e):
+    return jsonify({"error": "database_unreachable", "detail": str(e)}), 502
 
 
 if __name__ == "__main__":
