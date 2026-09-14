@@ -19,7 +19,15 @@ ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 
 VALID_BLOCKS = {"A": 6, "B": 6, "C": 3}
 
-REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else None
+def _normalize_base_url(url):
+    if not url:
+        return None
+    base = url.rstrip("/")
+    if base.endswith("/rest/v1"):
+        base = base[: -len("/rest/v1")]
+    return base
+
+REST_URL = f"{_normalize_base_url(SUPABASE_URL)}/rest/v1" if SUPABASE_URL else None
 REST_HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}" if SUPABASE_SERVICE_KEY else "",

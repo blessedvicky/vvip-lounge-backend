@@ -198,6 +198,12 @@ def run_tests():
     assert r.headers.get("Access-Control-Allow-Origin") == "*"
     print("PASS: CORS preflight headers present")
 
+    # 14. REST_URL normalization tolerates a SUPABASE_URL that already ends in /rest/v1
+    assert appmod._normalize_base_url("https://xxxx.supabase.co") == "https://xxxx.supabase.co"
+    assert appmod._normalize_base_url("https://xxxx.supabase.co/rest/v1") == "https://xxxx.supabase.co"
+    assert appmod._normalize_base_url("https://xxxx.supabase.co/rest/v1/") == "https://xxxx.supabase.co"
+    print("PASS: SUPABASE_URL normalization handles both plain and /rest/v1-suffixed values")
+
     print("\nAll tests passed.")
 
 
