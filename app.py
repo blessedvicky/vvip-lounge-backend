@@ -109,6 +109,8 @@ def register():
 
     if not name or block not in VALID_BLOCKS or not house_num:
         return jsonify({"error": "missing_fields"}), 400
+    if not data.get("agreed_terms"):
+        return jsonify({"error": "terms_not_accepted"}), 400
     if not (1 <= int(house_num) <= VALID_BLOCKS[block]):
         return jsonify({"error": "invalid_house_number"}), 400
 
@@ -127,6 +129,7 @@ def register():
         "emergency_phone": data.get("emergency_phone", ""),
         "roommates": data.get("roommates", []),
         "photo_url": data.get("photo_url", ""),
+        "agreed_terms": bool(data.get("agreed_terms", False)),
     }
     inserted_rows = pg_insert("tenants", tenant)
     pg_update("houses", {"profile_complete": True}, {"id": f"eq.{house['id']}"})
@@ -196,6 +199,16 @@ def remove_tenant(tenant_id):
     return jsonify({"status": "removed"})
 
 
+@app.route("/api/tenant/<int:tenant_id>/approve", methods=["POST"])
+def approve_tenant(tenant_id):
+    if not require_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    rows = pg_update("tenants", {"approved": True}, {"id": f"eq.{tenant_id}"})
+    if not rows:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"tenant": rows[0]})
+
+
 # ---------- COMPLAINTS ----------
 @app.route("/api/complaints", methods=["GET", "POST"])
 def complaints():
@@ -237,11 +250,14 @@ def tenant_complaints(tenant_id):
 @app.route("/api/renew", methods=["POST"])
 def renew():
     data = request.get_json(force=True)
+    if not data.get("payment_confirmed"):
+        return jsonify({"error": "payment_not_confirmed"}), 400
     pg_insert("renewals", {
         "tenant_id": data.get("tenant_id"),
         "block": data.get("block"),
         "house_num": data.get("house_num"),
         "tenant_name": data.get("tenant_name"),
+        "payment_confirmed": True,
     })
     return jsonify({"status": "ok"})
 

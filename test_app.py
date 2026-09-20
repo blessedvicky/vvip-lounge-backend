@@ -49,6 +49,9 @@ def make_fakes(store):
 
     def fake_insert(table, payload):
         row = dict(payload)
+        if table == "tenants":
+            row.setdefault("approved", False)
+            row.setdefault("paid", False)
         row["id"] = next_id(table)
         store[table].append(row)
         return [dict(row)]
@@ -104,25 +107,44 @@ def run_tests():
     assert "tenants" in r.get_json()[0]
     print("PASS: /api/houses/full gated by admin header, includes tenants")
 
+    # 3a. Registration rejected without terms acceptance
+    r = client.post("/api/register", json={
+        "name": "No Terms", "block": "C", "house_num": 2,
+        "roommates": [], "photo_url": "x"
+    })
+    assert r.status_code == 400 and r.get_json()["error"] == "terms_not_accepted"
+    print("PASS: registration rejected when terms not accepted")
+
     # 3. Register succeeds for an open house in block C
     r = client.post("/api/register", json={
         "name": "Faith Chebet", "block": "C", "house_num": 1,
         "course": "BCom", "phone": "0700000000",
         "emergency_name": "Sam", "emergency_phone": "0711111111",
-        "roommates": [], "photo_url": "data:image/jpeg;base64,xxx"
+        "roommates": [], "photo_url": "data:image/jpeg;base64,xxx", "agreed_terms": True
     })
     assert r.status_code == 200, r.get_json()
     assert r.get_json()["tenant"]["name"] == "Faith Chebet"
     tenant_id = r.get_json()["tenant"]["id"]
     print("PASS: register succeeds on open house in block C, returns tenant data")
 
+    # 3b. New registrations start unapproved
+    assert r.get_json()["tenant"]["approved"] is False
+    print("PASS: new registration starts as approved=false (pending landlady confirmation)")
+
+    # 3c. Approve requires admin header, then flips the flag
+    r2 = client.post(f"/api/tenant/{tenant_id}/approve")
+    assert r2.status_code == 403
+    r2 = client.post(f"/api/tenant/{tenant_id}/approve", headers=ADMIN_HEADERS)
+    assert r2.status_code == 200 and r2.get_json()["tenant"]["approved"] is True
+    print("PASS: admin approve endpoint flips approved to true")
+
     # 4. Invalid house number for block (C only has 3 houses)
-    r = client.post("/api/register", json={"name": "X", "block": "C", "house_num": 9})
-    assert r.status_code == 400
+    r = client.post("/api/register", json={"name": "X", "block": "C", "house_num": 9, "agreed_terms": True})
+    assert r.status_code == 400 and r.get_json()["error"] == "invalid_house_number"
     print("PASS: out-of-range house number for block rejected (400)")
 
     # 5. Duplicate registration on same house rejected
-    r = client.post("/api/register", json={"name": "Someone Else", "block": "C", "house_num": 1})
+    r = client.post("/api/register", json={"name": "Someone Else", "block": "C", "house_num": 1, "agreed_terms": True})
     assert r.status_code == 409
     print("PASS: duplicate registration on same house rejected (409)")
 
@@ -156,7 +178,7 @@ def run_tests():
     print("PASS: remove-tenant (admin header) frees the house")
 
     # 10. House is registrable again after removal
-    r = client.post("/api/register", json={"name": "New Tenant", "block": "C", "house_num": 1})
+    r = client.post("/api/register", json={"name": "New Tenant", "block": "C", "house_num": 1, "agreed_terms": True})
     assert r.status_code == 200
     print("PASS: house open again after removal")
 
@@ -170,7 +192,11 @@ def run_tests():
     assert r.status_code == 200
     print("PASS: complaints create + admin resolve (header auth)")
 
-    client.post("/api/renew", json={"tenant_id": new_tenant_id, "block": "C", "house_num": 1, "tenant_name": "New Tenant"})
+    r = client.post("/api/renew", json={"tenant_id": new_tenant_id, "block": "C", "house_num": 1, "tenant_name": "New Tenant"})
+    assert r.status_code == 400 and r.get_json()["error"] == "payment_not_confirmed"
+    print("PASS: renewal rejected without payment confirmation")
+
+    client.post("/api/renew", json={"tenant_id": new_tenant_id, "block": "C", "house_num": 1, "tenant_name": "New Tenant", "payment_confirmed": True})
     r = client.get("/api/renewals", headers=ADMIN_HEADERS)
     assert r.status_code == 200 and len(r.get_json()) == 1
     print("PASS: renewal interest recorded and listable by admin")
